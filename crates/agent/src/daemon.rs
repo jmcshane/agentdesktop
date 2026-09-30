@@ -14,8 +14,8 @@ use std::{
 
 use agentdesktop_core::config::GitHubTokenSource;
 use agentdesktop_core::{
-    DEFAULT_CONFIG_PATH, DEFAULT_SOCKET_PATH, DEFAULT_STATE_DIR, VERSION, config,
-    model::{DaemonControllerInfo, DaemonInfo, DaemonScope},
+    DEFAULT_CONFIG_PATH, DEFAULT_SOCKET_PATH, VERSION, config,
+    model::{DaemonControllerInfo, DaemonInfo, DaemonScope, LlmProxyInfo},
     telemetry,
 };
 use anyhow::{Context, bail};
@@ -34,7 +34,9 @@ use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 
 #[cfg(windows)]
 use crate::windows_security::SecurityDescriptor;
-use crate::{api, enrollment::EnrollmentState, gateway_oidc, reconcile, remote, secure_fs};
+use crate::{
+    api, enrollment::EnrollmentState, gateway_oidc, llm_proxy, reconcile, remote, secure_fs,
+};
 
 #[cfg(unix)]
 const LOCAL_API_GROUP: &str = "agentdesktop";
@@ -64,50 +66,6 @@ pub struct DaemonArgs {
     /// Path to the local YAML configuration file.
     #[arg(long)]
     config: Option<PathBuf>,
-
-    /// Directory used for persistent daemon state.
-    #[arg(long)]
-    state_dir: Option<PathBuf>,
-
-    /// Address for the OIDC callback server to bind instead of the redirect URI's loopback address.
-    #[arg(long)]
-    oidc_callback_listen: Option<SocketAddr>,
-
-    /// Start a loopback HTTP proxy to llmGateway, attaching the daemon's credentials.
-    #[arg(long, conflicts_with_all = ["once", "dry_run"])]
-    llm_proxy_listen: Option<SocketAddr>,
-
-    /// Credential policy client ID used by the local LLM proxy.
-    #[arg(long, default_value = "vscode")]
-    llm_proxy_client_id: String,
-
-    /// Path to Claude Code's Agentdesktop-managed settings file.
-    #[arg(long)]
-    claude_code_settings: Option<PathBuf>,
-
-    /// Path to Claude Desktop's system-managed JSON configuration.
-    #[arg(long)]
-    claude_desktop_managed_settings: Option<PathBuf>,
-
-    /// Path used for Claude Desktop's Agentdesktop credential helper.
-    #[arg(long)]
-    claude_desktop_credential_helper: Option<PathBuf>,
-
-    /// Path to Codex's organization-managed TOML configuration.
-    #[arg(long)]
-    codex_managed_config: Option<PathBuf>,
-
-    /// Path to OpenCode's system-managed JSONC configuration.
-    #[arg(long)]
-    open_code_managed_config: Option<PathBuf>,
-
-    /// Path used for Agentdesktop's OpenCode credential plugin.
-    #[arg(long)]
-    open_code_plugin: Option<PathBuf>,
-
-    /// Path to Grok Build's organization-managed TOML configuration.
-    #[arg(long)]
-    grok_managed_config: Option<PathBuf>,
 }
 
 struct ResolvedDaemonArgs {
@@ -118,59 +76,141 @@ struct ResolvedDaemonArgs {
     oidc_callback_listen: Option<SocketAddr>,
     llm_proxy_listen: Option<SocketAddr>,
     llm_proxy_client_id: String,
-    claude_code_settings: PathBuf,
-    claude_desktop_managed_settings: PathBuf,
-    claude_desktop_credential_helper: PathBuf,
-    codex_managed_config: PathBuf,
-    open_code_managed_config: PathBuf,
-    open_code_plugin: PathBuf,
-    grok_managed_config: PathBuf,
+    claude_code: ResolvedToolConfigPath,
+    claude_desktop: ResolvedClaudeDesktopStartupConfig,
+    codex: ResolvedToolConfigPath,
+    open_code: ResolvedOpenCodeStartupConfig,
+    grok: ResolvedToolConfigPath,
+    /// The Copilot CLI providers file; `None` in system mode (user-only program).
+    copilot_providers: Option<PathBuf>,
+    /// VS Code's `chatLanguageModels.json`; `None` in system mode (user-only program).
+    vscode_chat_models: Option<PathBuf>,
+    /// VS Code's user `settings.json`; `None` in system mode (user-only program).
+    vscode_settings: Option<PathBuf>,
+    /// `daemon.reconcileInterval`; `None` means no periodic re-apply.
+    reconcile_interval: Option<Duration>,
     once: bool,
     dry_run: bool,
 }
 
+struct ResolvedToolConfigPath {
+    config: PathBuf,
+}
+
+struct ResolvedClaudeDesktopStartupConfig {
+    config: PathBuf,
+    credential_helper: PathBuf,
+}
+
+struct ResolvedOpenCodeStartupConfig {
+    config: PathBuf,
+    plugin: PathBuf,
+}
+
 impl DaemonArgs {
-    fn resolve(self, socket: PathBuf) -> anyhow::Result<ResolvedDaemonArgs> {
-        if self
-            .llm_proxy_listen
-            .is_some_and(|address| !address.ip().is_loopback())
+    fn resolve(
+        self,
+        startup: config::DaemonStartupConfig,
+        config: PathBuf,
+        socket: PathBuf,
+    ) -> anyhow::Result<ResolvedDaemonArgs> {
+        let user = self.user || startup.user;
+        let socket = startup.socket.clone().unwrap_or(socket);
+        let llm_proxy_listen = startup.llm_proxy.listen;
+        // The proxy issues the current user's gateway credential to whatever
+        // connects on loopback; a system daemon has no single user to act for.
+        // Checked first so a system-mode operator sees this reason, not a
+        // secondary one about the address or the run mode.
+        if !user && llm_proxy_listen.is_some() {
+            // clientId without listen is inert in either mode; only listen is rejected.
+            bail!("daemon.llmProxy.listen requires --user (or daemon.user: true)");
+        }
+        if llm_proxy_listen.is_some_and(|address| !address.ip().is_loopback()) {
+            bail!("daemon.llmProxy.listen must be a loopback address");
+        }
+        if llm_proxy_listen.is_some() && (self.once || self.dry_run) {
+            bail!("daemon.llmProxy.listen cannot be combined with --once or --dry-run");
+        }
+        let llm_proxy_client_id = startup
+            .llm_proxy
+            .client_id
+            .clone()
+            .unwrap_or_else(|| "vscode".to_owned());
+        if llm_proxy_listen.is_some() && !config::valid_client_id(&llm_proxy_client_id) {
+            bail!("invalid daemon.llmProxy.clientId");
+        }
+        // VS Code's chatLanguageModels.json and settings.json live in the
+        // user's own profile, like the Copilot CLI providers file: a system
+        // daemon has no user file to manage, so an explicit override is
+        // rejected up front.
+        if !user
+            && let Some(field) = [
+                ("config", startup.vscode.config.is_some()),
+                ("settings", startup.vscode.settings.is_some()),
+            ]
+            .into_iter()
+            .find_map(|(field, set)| set.then_some(field))
         {
-            bail!("--llm-proxy-listen must be a loopback address");
+            bail!("daemon.vscode.{field} requires --user (or daemon.user: true)");
         }
-        if !config::valid_client_id(&self.llm_proxy_client_id) {
-            bail!("invalid --llm-proxy-client-id");
-        }
-        if !self.user {
+        if !user {
             return Ok(ResolvedDaemonArgs {
                 user: false,
-                config: self.config.unwrap_or_else(|| DEFAULT_CONFIG_PATH.into()),
-                state_dir: self.state_dir.unwrap_or_else(|| DEFAULT_STATE_DIR.into()),
+                config,
+                state_dir: startup
+                    .state_dir
+                    .unwrap_or_else(|| PathBuf::from(agentdesktop_core::DEFAULT_STATE_DIR)),
                 socket,
-                oidc_callback_listen: self.oidc_callback_listen,
-                llm_proxy_listen: Some("127.0.0.1:14000".parse().unwrap()),
-                llm_proxy_client_id: self.llm_proxy_client_id,
-                claude_code_settings: self.claude_code_settings.unwrap_or_else(|| {
-                    reconcile::default_claude_code_managed_settings_dir()
-                        .join("50-agentdesktop.json")
-                }),
-                claude_desktop_managed_settings: self
-                    .claude_desktop_managed_settings
-                    .unwrap_or_else(reconcile::default_claude_desktop_managed_settings_path),
-                claude_desktop_credential_helper: self
-                    .claude_desktop_credential_helper
-                    .unwrap_or_else(reconcile::default_claude_desktop_credential_helper_path),
-                codex_managed_config: self
-                    .codex_managed_config
-                    .unwrap_or_else(reconcile::default_codex_managed_config_path),
-                open_code_managed_config: self
-                    .open_code_managed_config
-                    .unwrap_or_else(reconcile::default_open_code_managed_config_path),
-                open_code_plugin: self
-                    .open_code_plugin
-                    .unwrap_or_else(reconcile::default_open_code_plugin_path),
-                grok_managed_config: self
-                    .grok_managed_config
-                    .unwrap_or_else(reconcile::default_grok_managed_config_path),
+                oidc_callback_listen: startup.oidc_callback_listen,
+                llm_proxy_listen: None,
+                llm_proxy_client_id: llm_proxy_client_id.clone(),
+                claude_code: ResolvedToolConfigPath {
+                    config: startup.claude_code.config.unwrap_or_else(|| {
+                        reconcile::default_claude_code_managed_settings_dir()
+                            .join("50-agentdesktop.json")
+                    }),
+                },
+                claude_desktop: ResolvedClaudeDesktopStartupConfig {
+                    config: startup
+                        .claude_desktop
+                        .config
+                        .unwrap_or_else(reconcile::default_claude_desktop_managed_settings_path),
+                    credential_helper: startup
+                        .claude_desktop
+                        .credential_helper
+                        .unwrap_or_else(reconcile::default_claude_desktop_credential_helper_path),
+                },
+                codex: ResolvedToolConfigPath {
+                    config: startup
+                        .codex
+                        .config
+                        .unwrap_or_else(reconcile::default_codex_managed_config_path),
+                },
+                open_code: ResolvedOpenCodeStartupConfig {
+                    config: startup
+                        .open_code
+                        .config
+                        .unwrap_or_else(reconcile::default_open_code_managed_config_path),
+                    plugin: startup
+                        .open_code
+                        .plugin
+                        .unwrap_or_else(reconcile::default_open_code_plugin_path),
+                },
+                grok: ResolvedToolConfigPath {
+                    config: startup
+                        .grok
+                        .config
+                        .unwrap_or_else(reconcile::default_grok_managed_config_path),
+                },
+                copilot_providers: {
+                    if startup.copilot.config.is_some() {
+                        bail!("daemon.copilot.config requires --user (or daemon.user: true)");
+                    }
+                    None
+                },
+                vscode_chat_models: None,
+                vscode_settings: None,
+                reconcile_interval: startup.reconcile_interval,
                 once: self.once || self.dry_run,
                 dry_run: self.dry_run,
             });
@@ -183,10 +223,10 @@ impl DaemonArgs {
         let state_home = std::env::var_os("XDG_STATE_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".local/state"));
-        let state_dir = self
+        let state_dir = startup
             .state_dir
             .unwrap_or_else(|| state_home.join("agentdesktop"));
-        let socket = if socket == Path::new(DEFAULT_SOCKET_PATH) {
+        let socket = if startup.socket.is_none() && socket == Path::new(DEFAULT_SOCKET_PATH) {
             user_socket_path(&state_dir)
         } else {
             socket
@@ -194,39 +234,70 @@ impl DaemonArgs {
         let claude_desktop_settings = user_claude_desktop_settings(&home, &config_home);
         Ok(ResolvedDaemonArgs {
             user: true,
-            config: self
-                .config
-                .unwrap_or_else(|| config_home.join("agentdesktop/config.yaml")),
+            config,
             state_dir: state_dir.clone(),
             socket,
-            oidc_callback_listen: self.oidc_callback_listen,
-            llm_proxy_listen: self.llm_proxy_listen,
-            llm_proxy_client_id: self.llm_proxy_client_id,
-            claude_code_settings: self
-                .claude_code_settings
-                .unwrap_or_else(|| home.join(".claude/settings.json")),
-            claude_desktop_managed_settings: self
-                .claude_desktop_managed_settings
-                .unwrap_or(claude_desktop_settings),
-            claude_desktop_credential_helper: self
-                .claude_desktop_credential_helper
-                .unwrap_or_else(|| state_dir.join("bin/claude-desktop-credential-helper")),
-            codex_managed_config: self
-                .codex_managed_config
-                .unwrap_or_else(|| home.join(".codex/config.toml")),
-            open_code_managed_config: self
-                .open_code_managed_config
-                .unwrap_or_else(|| config_home.join("opencode/opencode.json")),
-            open_code_plugin: self
-                .open_code_plugin
-                .unwrap_or_else(|| config_home.join("opencode/plugins/agentdesktop.js")),
-            grok_managed_config: self.grok_managed_config.unwrap_or_else(|| {
-                std::env::var_os("GROK_HOME")
-                    .filter(|value| !value.is_empty())
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| home.join(".grok"))
-                    .join("managed_config.toml")
+            oidc_callback_listen: startup.oidc_callback_listen,
+            llm_proxy_listen,
+            llm_proxy_client_id,
+            claude_code: ResolvedToolConfigPath {
+                config: startup
+                    .claude_code
+                    .config
+                    .unwrap_or_else(|| home.join(".claude/settings.json")),
+            },
+            claude_desktop: ResolvedClaudeDesktopStartupConfig {
+                config: startup
+                    .claude_desktop
+                    .config
+                    .unwrap_or(claude_desktop_settings),
+                credential_helper: startup
+                    .claude_desktop
+                    .credential_helper
+                    .unwrap_or_else(|| state_dir.join("bin/claude-desktop-credential-helper")),
+            },
+            codex: ResolvedToolConfigPath {
+                config: startup
+                    .codex
+                    .config
+                    .unwrap_or_else(|| home.join(".codex/config.toml")),
+            },
+            open_code: ResolvedOpenCodeStartupConfig {
+                config: startup
+                    .open_code
+                    .config
+                    .unwrap_or_else(|| config_home.join("opencode/opencode.json")),
+                plugin: startup
+                    .open_code
+                    .plugin
+                    .unwrap_or_else(|| config_home.join("opencode/plugins/agentdesktop.js")),
+            },
+            grok: ResolvedToolConfigPath {
+                config: startup.grok.config.unwrap_or_else(|| {
+                    std::env::var_os("GROK_HOME")
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| home.join(".grok"))
+                        .join("managed_config.toml")
+                }),
+            },
+            copilot_providers: Some(match startup.copilot.config {
+                Some(path) => path,
+                None => reconcile::default_copilot_providers_path()?,
             }),
+            vscode_chat_models: Some(
+                startup
+                    .vscode
+                    .config
+                    .unwrap_or_else(|| reconcile::default_vscode_chat_models_path(&home)),
+            ),
+            vscode_settings: Some(
+                startup
+                    .vscode
+                    .settings
+                    .unwrap_or_else(|| reconcile::default_vscode_settings_path(&home)),
+            ),
+            reconcile_interval: startup.reconcile_interval,
             once: self.once || self.dry_run,
             dry_run: self.dry_run,
         })
@@ -283,22 +354,59 @@ pub async fn run_until_shutdown<F>(
 where
     F: Future<Output = anyhow::Result<()>> + Send,
 {
-    let args = args.resolve(socket)?;
+    if socket != Path::new(DEFAULT_SOCKET_PATH) {
+        bail!("set daemon.socket in the configuration file; --socket is for client commands");
+    }
+    let config_path = match args.config.clone() {
+        Some(path) => path,
+        None if args.user => std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or(home_directory()?.join(".config"))
+            .join("agentdesktop/config.yaml"),
+        None => DEFAULT_CONFIG_PATH.into(),
+    };
+    let config = config::load_daemon(&config_path)?;
+    let startup = config.daemon.clone().unwrap_or_default();
+    let args = args.resolve(startup, config_path, socket)?;
     let _log_flush = telemetry::setup_logging(if args.once { "warn" } else { "info" }, false);
     let socket = args.socket.clone();
-    let config = config::load_daemon(&args.config)?;
+    // Bind the loopback proxy before the reconciler exists, so anything that
+    // writes the proxy address into a managed file gets the bind result, never
+    // a configured address the daemon does not own. A failed bind is reported
+    // through daemon-info and the proxy stays off; the daemon keeps enrolling
+    // and reconciling, since a port taken by some other process must not take
+    // the device out of the fleet.
+    let (mut proxy_listener, mut llm_proxy) =
+        bind_llm_proxy(args.llm_proxy_listen, &args.llm_proxy_client_id).await;
+    let pairing = attach_llm_proxy_pairing(&mut proxy_listener, &mut llm_proxy, &args.state_dir);
+    let proxy_context = match (&proxy_listener, &pairing) {
+        (Some(listener), Some(pairing)) => {
+            listener
+                .local_addr()
+                .ok()
+                .map(|address| llm_proxy::LlmProxyContext {
+                    address,
+                    pairing: pairing.clone(),
+                })
+        }
+        _ => None,
+    };
     let reconciler = reconcile::Reconciler::new(
         args.user,
-        args.claude_code_settings.clone(),
-        args.claude_desktop_managed_settings.clone(),
-        args.claude_desktop_credential_helper.clone(),
-        args.codex_managed_config.clone(),
-        args.open_code_managed_config.clone(),
-        args.open_code_plugin.clone(),
-        args.grok_managed_config.clone(),
+        args.claude_code.config.clone(),
+        args.claude_desktop.config.clone(),
+        args.claude_desktop.credential_helper.clone(),
+        args.codex.config.clone(),
+        args.open_code.config.clone(),
+        args.open_code.plugin.clone(),
+        args.grok.config.clone(),
+        args.copilot_providers.clone(),
+        args.vscode_chat_models.clone(),
+        args.vscode_settings.clone(),
         agentdesktop_client_executable()?,
         socket.clone(),
-    );
+    )
+    .with_llm_proxy(proxy_context);
     if args.once {
         if args.dry_run {
             validate_dry_run(&config)?;
@@ -307,21 +415,21 @@ where
                 .context("preview daemon configuration")?;
         } else {
             validate_one_shot(&config)?;
-            reconciler
-                .apply(&config)
-                .context("apply daemon configuration")?;
+            let (report, applied) = reconciler.apply_with_report(&config);
+            report.log();
+            applied.context("apply daemon configuration")?;
             println!("Reconciliation complete.");
         }
         return Ok(());
     }
 
-    let daemon_info = describe_daemon(&config, &args.config, &args.state_dir, args.user);
+    let daemon_info = describe_daemon(&config, &args.config, &args.state_dir, args.user, llm_proxy);
     secure_fs::ensure_private_dir(&args.state_dir)?;
     start_gateway_authentication(
         &config,
         args.state_dir.clone(),
         args.oidc_callback_listen,
-        args.llm_proxy_listen.is_some(),
+        proxy_listener.is_some(),
     );
     let enrollment = EnrollmentState::new(config.controller.is_some());
     let local_config = config.clone();
@@ -355,14 +463,36 @@ where
     } else {
         Some(local_config)
     };
-    if let Some(initial_config) = initial_config {
-        reconciler
-            .apply(&initial_config)
-            .context("apply initial daemon configuration")?;
+    if let Some(initial_config) = &initial_config {
+        // The outcomes are logged before a failure stops the daemon.
+        let (report, applied) = reconciler.apply_with_report(initial_config);
+        report.log();
+        applied.context("apply initial daemon configuration")?;
     } else {
         tracing::info!(
             "preserving managed files until the controller provides daemon configuration"
         );
+    }
+    // The current configuration, re-applied by the reconcile tick; held here
+    // for the daemon's lifetime and replaced by each pushed configuration.
+    let (current_config, current_config_receiver) =
+        watch::channel(initial_config.map(|config| crate::tick::CurrentConfig {
+            revision: None,
+            config: Arc::new(config),
+        }));
+    let (tick_status_sender, tick_status_receiver) = watch::channel(None);
+    let tick_enabled = args.reconcile_interval.is_some();
+    if let Some(interval) = args.reconcile_interval {
+        tracing::info!(
+            interval_seconds = interval.as_secs_f64(),
+            "reconcile tick enabled"
+        );
+        tokio::spawn(crate::tick::run_tick(
+            reconciler.clone(),
+            current_config_receiver,
+            interval,
+            config.controller.is_some().then_some(tick_status_sender),
+        ));
     }
     let discovery = reconciler.discover().await;
     log_discovery(&discovery);
@@ -377,6 +507,7 @@ where
     let (logout_sender, logout_receiver) = mpsc::channel(1);
     let logout = config.controller.as_ref().map(|_| logout_sender);
     if let Some(controller) = config.controller.clone() {
+        let remote_current_config = current_config.clone();
         let remote_discovery = inventory.clone();
         let state_dir = args.state_dir.clone();
         let oidc_callback_listen = args.oidc_callback_listen;
@@ -392,6 +523,8 @@ where
                 remote::Requests {
                     telemetry: telemetry_receiver,
                     logout: logout_receiver,
+                    current: remote_current_config,
+                    tick_statuses: tick_enabled.then_some(tick_status_receiver),
                 },
             )
             .await
@@ -411,23 +544,28 @@ where
         telemetry,
         logout,
     };
-    let proxy_listener = if let Some(address) = args.llm_proxy_listen {
-        let listener = tokio::net::TcpListener::bind(address)
-            .await
-            .context("bind local LLM proxy")?;
-        tracing::info!(address = %listener.local_addr()?, "local LLM proxy listening");
-        Some(listener)
-    } else {
-        None
-    };
     let app = api::router(state.clone());
+    // The proxy is optional at runtime too: if serving fails (for example the
+    // TLS root store cannot be built), log it and keep the daemon running
+    // without the proxy rather than dropping the device out of the fleet.
     let proxy = async move {
-        match proxy_listener {
-            Some(listener) => {
-                crate::llm_proxy::serve(listener, state, args.llm_proxy_client_id).await
-            }
-            None => std::future::pending::<anyhow::Result<()>>().await,
+        if let Some(listener) = proxy_listener
+            && let Err(error) = llm_proxy::serve(
+                listener,
+                state,
+                llm_proxy::ProxyConfig {
+                    default_client_id: args.llm_proxy_client_id,
+                    pairing: pairing.expect("pairing exists whenever the listener does"),
+                },
+            )
+            .await
+        {
+            tracing::error!(
+                error = %format!("{error:#}"),
+                "local LLM proxy stopped; proxy unavailable until the daemon restarts"
+            );
         }
+        std::future::pending::<anyhow::Result<()>>().await
     };
 
     tracing::info!(socket = %socket.display(), "agent daemon listening");
@@ -443,11 +581,90 @@ where
     Ok(())
 }
 
+/// Load or create the pairing value for a bound proxy. Without a pairing value
+/// the proxy would accept anyone on the host, so a failure to obtain one
+/// switches the proxy off like a failed bind: the listener is dropped and
+/// daemon-info reports `bound: false` with the reason.
+fn attach_llm_proxy_pairing(
+    proxy_listener: &mut Option<tokio::net::TcpListener>,
+    llm_proxy: &mut Option<LlmProxyInfo>,
+    state_dir: &Path,
+) -> Option<std::sync::Arc<str>> {
+    proxy_listener.as_ref()?;
+    match llm_proxy::load_or_create_pairing(state_dir) {
+        Ok(pairing) => Some(pairing),
+        Err(error) => {
+            tracing::error!(
+                error = %format!("{error:#}"),
+                "LLM proxy pairing unavailable; proxy disabled until the daemon restarts"
+            );
+            *proxy_listener = None;
+            if let Some(info) = llm_proxy.as_mut() {
+                info.bound = false;
+                info.error = Some(format!("pairing unavailable: {error:#}"));
+            }
+            None
+        }
+    }
+}
+
+/// Bind the loopback LLM proxy listener, if one is configured.
+///
+/// Returns the listener and the state to report through daemon-info. A bind
+/// failure is logged and reported as `bound: false` rather than propagated:
+/// the proxy is optional, the rest of the daemon is not.
+///
+/// Invariant for callers: this runs before the initial apply, so a
+/// reconciler that writes the proxy address into a client file must take the
+/// address from this result and must not write it when `bound` is false. The
+/// accept loop starts later, after discovery; connections in between queue in
+/// the listen backlog.
+async fn bind_llm_proxy(
+    listen: Option<SocketAddr>,
+    client_id: &str,
+) -> (Option<tokio::net::TcpListener>, Option<LlmProxyInfo>) {
+    let Some(address) = listen else {
+        return (None, None);
+    };
+    match tokio::net::TcpListener::bind(address).await {
+        Ok(listener) => {
+            let bound = listener.local_addr().unwrap_or(address);
+            tracing::info!(address = %bound, "local LLM proxy listening");
+            (
+                Some(listener),
+                Some(LlmProxyInfo {
+                    listen: bound.to_string(),
+                    bound: true,
+                    client_id: client_id.to_owned(),
+                    error: None,
+                }),
+            )
+        }
+        Err(error) => {
+            tracing::error!(
+                address = %address,
+                %error,
+                "local LLM proxy could not bind; proxy and its GitHub sign-in step disabled until the daemon restarts"
+            );
+            (
+                None,
+                Some(LlmProxyInfo {
+                    listen: address.to_string(),
+                    bound: false,
+                    client_id: client_id.to_owned(),
+                    error: Some(error.to_string()),
+                }),
+            )
+        }
+    }
+}
+
 fn describe_daemon(
     config: &config::DaemonConfig,
     config_path: &Path,
     state_directory: &Path,
     user: bool,
+    llm_proxy: Option<LlmProxyInfo>,
 ) -> DaemonInfo {
     let controller = config
         .controller
@@ -471,6 +688,7 @@ fn describe_daemon(
         state_directory: path_for_display(state_directory),
         inventory_interval: config.inventory_interval,
         controller,
+        llm_proxy,
     }
 }
 
@@ -676,6 +894,16 @@ fn validate_one_shot(config: &agentdesktop_core::config::DaemonConfig) -> anyhow
     if !config.telemetry.events.is_empty() {
         bail!("--once cannot collect telemetry because hooks require the daemon to remain running");
     }
+    if config.programs.copilot.is_some() {
+        bail!(
+            "--once cannot manage the GitHub Copilot CLI providers file because its local proxy requires the daemon to remain running"
+        );
+    }
+    if config.programs.vscode.is_some() {
+        bail!(
+            "--once cannot manage the VS Code chatLanguageModels.json and settings.json files because their local proxy requires the daemon to remain running"
+        );
+    }
     let authenticated_gateway_is_used = config
         .llm_gateway
         .as_ref()
@@ -704,6 +932,16 @@ fn validate_one_shot(config: &agentdesktop_core::config::DaemonConfig) -> anyhow
             config
                 .programs
                 .grok
+                .as_ref()
+                .is_some_and(|program| program.use_llm_gateway),
+            config
+                .programs
+                .copilot
+                .as_ref()
+                .is_some_and(|program| program.use_llm_gateway),
+            config
+                .programs
+                .vscode
                 .as_ref()
                 .is_some_and(|program| program.use_llm_gateway),
         ]
@@ -943,7 +1181,7 @@ fn effective_uid() -> u32 {
 mod tests {
     use std::{
         io,
-        path::Path,
+        path::{Path, PathBuf},
         pin::Pin,
         sync::{
             Arc,
@@ -953,8 +1191,10 @@ mod tests {
         time::Duration,
     };
 
-    use agentdesktop_core::config::parse_daemon;
-    use agentdesktop_core::model::{Agent, Discovery};
+    use super::{DaemonArgs, bind_llm_proxy};
+    use agentdesktop_core::DEFAULT_SOCKET_PATH;
+    use agentdesktop_core::config::{self, parse_daemon};
+    use agentdesktop_core::model::{Agent, Discovery, LlmProxyInfo};
     use tokio::sync::watch;
 
     fn discovery(kinds: &[&str]) -> Discovery {
@@ -1048,7 +1288,13 @@ mod tests {
     #[test]
     fn daemon_information_reports_standalone_defaults_and_resolved_paths() {
         let config = parse_daemon("{}").unwrap();
-        let info = describe_daemon(&config, Path::new("config.yaml"), Path::new("state"), true);
+        let info = describe_daemon(
+            &config,
+            Path::new("config.yaml"),
+            Path::new("state"),
+            true,
+            None,
+        );
 
         assert_eq!(info.version, agentdesktop_core::VERSION);
         assert_eq!(info.scope, super::DaemonScope::User);
@@ -1104,7 +1350,13 @@ mod tests {
             "controller:\n  address: https://controller.example.com\n  caCertificatePath: ''\n",
         )
         .unwrap();
-        let info = describe_daemon(&config, Path::new("config.yaml"), Path::new("state"), false);
+        let info = describe_daemon(
+            &config,
+            Path::new("config.yaml"),
+            Path::new("state"),
+            false,
+            None,
+        );
         assert_eq!(
             info.controller.unwrap().ca_certificate_path.as_deref(),
             Some("")
@@ -1131,7 +1383,7 @@ programs:
         )
         .unwrap();
         let config = agentdesktop_core::config::load_daemon(&config_path).unwrap();
-        let info = describe_daemon(&config, &config_path, root.path(), false);
+        let info = describe_daemon(&config, &config_path, root.path(), false, None);
         assert_eq!(info.scope, super::DaemonScope::System);
         let controller = info.controller.as_ref().unwrap();
         assert_eq!(controller.heartbeat_interval, Duration::from_secs(45));
@@ -1230,7 +1482,7 @@ programs:
         // Keep invalid-byte paths in memory: filesystems such as APFS reject
         // these filenames, but the diagnostic projection must handle them.
         let config = parse_daemon("{}").unwrap();
-        let info = describe_daemon(&config, &config_path, &state_dir, true);
+        let info = describe_daemon(&config, &config_path, &state_dir, true, None);
         let (_, inventory) = watch::channel(Arc::new(discovery(&[])));
         let app = crate::api::router(crate::api::AppState {
             config,
@@ -1412,6 +1664,48 @@ telemetry:
     }
 
     #[test]
+    fn one_shot_rejects_the_copilot_program() {
+        let copilot = parse_daemon(
+            r#"
+llmGateway:
+  url: https://gateway.example.com
+programs:
+  copilot:
+    models:
+      gpt-4.1: {}
+"#,
+        )
+        .unwrap();
+        assert!(
+            validate_one_shot(&copilot)
+                .unwrap_err()
+                .to_string()
+                .contains("Copilot")
+        );
+    }
+
+    #[test]
+    fn one_shot_rejects_the_vscode_program() {
+        let vscode = parse_daemon(
+            r#"
+llmGateway:
+  url: https://gateway.example.com
+programs:
+  vscode:
+    models:
+      gpt-4.1-mini: {}
+"#,
+        )
+        .unwrap();
+        assert!(
+            validate_one_shot(&vscode)
+                .unwrap_err()
+                .to_string()
+                .contains("VS Code")
+        );
+    }
+
+    #[test]
     fn dry_run_rejects_controller_managed_configuration() {
         let managed = parse_daemon(
             r#"
@@ -1437,5 +1731,289 @@ programs:
         )
         .expect("valid local configuration");
         validate_dry_run(&local).expect("local dry run works");
+    }
+    fn daemon_args(user: bool) -> DaemonArgs {
+        DaemonArgs {
+            user,
+            once: false,
+            dry_run: false,
+            config: None,
+        }
+    }
+
+    fn resolve_error(args: DaemonArgs, startup: config::DaemonStartupConfig) -> anyhow::Error {
+        match args.resolve(
+            startup,
+            PathBuf::from("config.yaml"),
+            PathBuf::from(DEFAULT_SOCKET_PATH),
+        ) {
+            Ok(_) => panic!("resolve succeeded unexpectedly"),
+            Err(error) => error,
+        }
+    }
+
+    fn startup_with_llm_proxy(listen: &str) -> config::DaemonStartupConfig {
+        let mut startup = config::DaemonStartupConfig::default();
+        startup.llm_proxy.listen = Some(listen.parse().unwrap());
+        startup
+    }
+
+    #[test]
+    fn system_mode_rejects_a_copilot_providers_path() {
+        let mut startup = config::DaemonStartupConfig::default();
+        startup.copilot.config = Some(PathBuf::from("/tmp/providers.json"));
+        let error = resolve_error(daemon_args(false), startup);
+        assert!(
+            error
+                .to_string()
+                .contains("daemon.copilot.config requires --user"),
+            "{error:#}"
+        );
+    }
+
+    // Added with the implementation (not part of the spec-derived baseline).
+    #[test]
+    fn the_reconcile_tick_is_off_unless_an_interval_is_set() {
+        let resolved = daemon_args(true)
+            .resolve(
+                config::DaemonStartupConfig::default(),
+                PathBuf::from("config.yaml"),
+                PathBuf::from("agentdesktop.sock"),
+            )
+            .unwrap();
+        assert_eq!(resolved.reconcile_interval, None);
+        let startup = config::DaemonStartupConfig {
+            reconcile_interval: Some(Duration::from_secs(120)),
+            ..Default::default()
+        };
+        let resolved = daemon_args(true)
+            .resolve(
+                startup,
+                PathBuf::from("config.yaml"),
+                PathBuf::from("agentdesktop.sock"),
+            )
+            .unwrap();
+        assert_eq!(resolved.reconcile_interval, Some(Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn system_mode_rejects_a_vscode_settings_path() {
+        let mut startup = config::DaemonStartupConfig::default();
+        startup.vscode.settings = Some(PathBuf::from("/tmp/settings.json"));
+        let error = resolve_error(daemon_args(false), startup);
+        assert!(
+            error
+                .to_string()
+                .contains("daemon.vscode.settings requires --user"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn system_mode_rejects_a_vscode_chat_models_path() {
+        let mut startup = config::DaemonStartupConfig::default();
+        startup.vscode.config = Some(PathBuf::from("/tmp/chatLanguageModels.json"));
+        let error = resolve_error(daemon_args(false), startup);
+        assert!(
+            error
+                .to_string()
+                .contains("daemon.vscode.config requires --user"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn system_mode_rejects_a_configured_llm_proxy() {
+        let error = resolve_error(
+            daemon_args(false),
+            startup_with_llm_proxy("127.0.0.1:18095"),
+        );
+        assert!(
+            error.to_string().contains("requires --user"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn system_mode_runs_no_llm_proxy_by_default() {
+        let resolved = daemon_args(false)
+            .resolve(
+                config::DaemonStartupConfig::default(),
+                PathBuf::from("config.yaml"),
+                PathBuf::from(DEFAULT_SOCKET_PATH),
+            )
+            .unwrap();
+        assert_eq!(resolved.llm_proxy_listen, None);
+    }
+
+    #[test]
+    fn user_mode_keeps_the_configured_llm_proxy_address_and_default_client_id() {
+        // Pin the state dir and socket so XDG variables do not matter. resolve()
+        // still needs a home directory (HOME / USERPROFILE), like every user-mode
+        // daemon start.
+        let mut startup = startup_with_llm_proxy("127.0.0.1:18095");
+        startup.state_dir = Some(PathBuf::from("/tmp/agentdesktop-test-state"));
+        startup.socket = Some(PathBuf::from("/tmp/agentdesktop-test.sock"));
+        let resolved = daemon_args(true)
+            .resolve(
+                startup,
+                PathBuf::from("config.yaml"),
+                PathBuf::from(DEFAULT_SOCKET_PATH),
+            )
+            .unwrap();
+        assert_eq!(
+            resolved.llm_proxy_listen,
+            Some("127.0.0.1:18095".parse().unwrap())
+        );
+        assert_eq!(resolved.llm_proxy_client_id, "vscode");
+    }
+
+    #[test]
+    fn client_id_is_only_validated_when_a_listen_address_is_set() {
+        let mut startup = config::DaemonStartupConfig::default();
+        startup.llm_proxy.client_id = Some("not valid!".to_owned());
+        let resolved = daemon_args(false)
+            .resolve(
+                startup.clone(),
+                PathBuf::from("config.yaml"),
+                PathBuf::from(DEFAULT_SOCKET_PATH),
+            )
+            .map(|_| ());
+        assert!(
+            resolved.is_ok(),
+            "clientId without listen must not fail startup"
+        );
+        let mut user_startup = startup.clone();
+        user_startup.state_dir = Some(PathBuf::from("/tmp/agentdesktop-test-state"));
+        user_startup.socket = Some(PathBuf::from("/tmp/agentdesktop-test.sock"));
+        let resolved = daemon_args(true)
+            .resolve(
+                user_startup,
+                PathBuf::from("config.yaml"),
+                PathBuf::from(DEFAULT_SOCKET_PATH),
+            )
+            .map(|resolved| resolved.llm_proxy_listen);
+        assert!(
+            matches!(resolved, Ok(None)),
+            "clientId without listen is inert in user mode too"
+        );
+        startup.llm_proxy.listen = Some("127.0.0.1:18095".parse().unwrap());
+        let error = resolve_error(daemon_args(true), startup);
+        assert!(error.to_string().contains("clientId"));
+    }
+
+    #[test]
+    fn llm_proxy_rejects_non_loopback_and_one_shot_runs() {
+        let error = resolve_error(daemon_args(true), startup_with_llm_proxy("0.0.0.0:18095"));
+        assert!(error.to_string().contains("loopback"));
+        let mut once = daemon_args(true);
+        once.once = true;
+        let error = resolve_error(once, startup_with_llm_proxy("127.0.0.1:18095"));
+        assert!(error.to_string().contains("--once"));
+        let mut dry_run = daemon_args(true);
+        dry_run.dry_run = true;
+        let error = resolve_error(dry_run, startup_with_llm_proxy("127.0.0.1:18095"));
+        assert!(error.to_string().contains("--once"));
+    }
+
+    #[test]
+    fn system_mode_reports_the_user_mode_rule_before_other_checks() {
+        // A system-mode operator with a non-loopback address must see the real
+        // reason, not the loopback rule.
+        let error = resolve_error(daemon_args(false), startup_with_llm_proxy("0.0.0.0:18095"));
+        assert!(error.to_string().contains("requires --user"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn llm_proxy_bind_failure_is_reported_not_fatal() {
+        let taken = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = taken.local_addr().unwrap();
+        let (listener, info) = bind_llm_proxy(Some(address), "vscode").await;
+        assert!(listener.is_none());
+        let info = info.expect("proxy info");
+        assert_eq!(info.listen, address.to_string());
+        assert!(!info.bound);
+        assert_eq!(info.client_id, "vscode");
+        assert!(info.error.as_deref().is_some_and(|error| !error.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn llm_proxy_bind_reports_the_bound_address() {
+        let (listener, info) =
+            bind_llm_proxy(Some("127.0.0.1:0".parse().unwrap()), "copilot-cli").await;
+        let listener = listener.expect("listener bound");
+        let info = info.expect("proxy info");
+        assert!(info.bound);
+        assert_eq!(info.listen, listener.local_addr().unwrap().to_string());
+        assert_eq!(info.client_id, "copilot-cli");
+        let (none, info) = bind_llm_proxy(None, "vscode").await;
+        assert!(none.is_none() && info.is_none());
+    }
+
+    #[tokio::test]
+    async fn pairing_failure_switches_the_proxy_off_and_reports_it() {
+        // A state directory that is a regular file: reading the pairing file
+        // fails (not a directory), which is neither "missing" nor "unusable", so
+        // no pairing is created and the proxy is switched off.
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("state-as-file");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let (mut listener, mut info) =
+            bind_llm_proxy(Some("127.0.0.1:0".parse().unwrap()), "copilot-cli").await;
+        assert!(listener.is_some());
+        let pairing = super::attach_llm_proxy_pairing(&mut listener, &mut info, &blocked);
+        assert!(pairing.is_none());
+        assert!(
+            listener.is_none(),
+            "the listener is dropped when no pairing exists"
+        );
+        let info = info.expect("proxy info");
+        assert!(!info.bound);
+        assert!(
+            info.error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("pairing unavailable"))
+        );
+        // A usable state directory keeps the listener and yields the pairing.
+        let (mut listener, mut info) =
+            bind_llm_proxy(Some("127.0.0.1:0".parse().unwrap()), "copilot-cli").await;
+        let pairing = super::attach_llm_proxy_pairing(&mut listener, &mut info, dir.path());
+        assert!(pairing.is_some() && listener.is_some() && info.unwrap().bound);
+    }
+
+    #[test]
+    fn daemon_information_reports_the_llm_proxy_state() {
+        let config = parse_daemon("{}").unwrap();
+        let proxy = LlmProxyInfo {
+            listen: "127.0.0.1:18095".to_owned(),
+            bound: true,
+            client_id: "vscode".to_owned(),
+            error: None,
+        };
+        let info = describe_daemon(
+            &config,
+            Path::new("config.yaml"),
+            Path::new("state"),
+            true,
+            Some(proxy.clone()),
+        );
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["llmProxy"]["bound"], serde_json::Value::Bool(true));
+        assert_eq!(json["llmProxy"]["listen"], "127.0.0.1:18095");
+        assert_eq!(json["llmProxy"]["clientId"], "vscode");
+        assert!(json["llmProxy"].get("error").is_none());
+        let without = describe_daemon(
+            &config,
+            Path::new("config.yaml"),
+            Path::new("state"),
+            true,
+            None,
+        );
+        assert!(
+            serde_json::to_value(&without)
+                .unwrap()
+                .get("llmProxy")
+                .is_none()
+        );
     }
 }
